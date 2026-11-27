@@ -2122,9 +2122,9 @@ static NSDictionary *TRShelvesHome(NSDictionary *norm) {
                     }
                 }
                 if ([vids count] < 4) { [outSecs addObject:sec]; continue; }
-                NSUInteger per = vertical ? 5 : 10, n = 0;
-                for (NSUInteger i = 0; i < [vids count]; i += per, n++) {
-                    NSArray *chunk = [vids subarrayWithRange:NSMakeRange(i, MIN(per, [vids count] - i))];
+                NSUInteger n = 0;
+                for (NSUInteger i = 0, take = vertical ? 5 : 10; i < [vids count]; i += take, take = 10, n++) {
+                    NSArray *chunk = [vids subarrayWithRange:NSMakeRange(i, MIN(take, [vids count] - i))];
                     NSString *ttl = n == 0 ? (vertical ? @"Recommended" : @"Recommended videos") : @"More videos";
                     NSDictionary *shelf = @{ @"title": TRSimpleText(ttl),
                         @"content": vertical ? @{ @"verticalListRenderer": @{ @"items": chunk } } : @{ @"horizontalListRenderer": @{ @"items": chunk } } };
@@ -3278,7 +3278,73 @@ static void TRTrendingFromSearch(void (^done)(NSArray *items)) {
     });
 }
 
-// Signed-in home feed: mix the order of the recommended videos on every open (the server often returns the same list).
+// ---- Signed-in home feed tuning (runs off the main thread, before the layout code sees the feed) ----
+static const NSUInteger kTRHomeExtraPages = 1;  // extra pages of recommendations fetched and merged in (more videos)
+static const NSUInteger kTRHomeMaxMixes   = 2;  // how many "Mix" playlists to keep on the home feed
+
+// Fetch the next page(s) of the home feed and append their videos to the first video section.
+static NSDictionary *TRExtendHomeFeed(NSDictionary *norm) {
+    if ([NSThread isMainThread] || !kTRHomeExtraPages) return norm;
+    @try {
+        NSData *jd = [NSJSONSerialization dataWithJSONObject:norm options:0 error:nil];
+        id mn = jd ? [NSJSONSerialization JSONObjectWithData:jd options:NSJSONReadingMutableContainers error:nil] : nil;
+        if (![mn isKindOfClass:[NSMutableDictionary class]]) return norm;
+        NSMutableArray *sls = [NSMutableArray array];
+        TRCollectKey(mn, @"sectionListRenderer", sls, 0);
+        NSMutableDictionary *sl = nil;
+        for (id c in sls) if ([c isKindOfClass:[NSMutableDictionary class]]) { sl = c; break; }
+        if (!sl) return norm;
+        NSArray *conts = [sl[@"continuations"] isKindOfClass:[NSArray class]] ? sl[@"continuations"] : nil;
+        NSString *token = [conts count] ? TRDig(conts[0], @[@"nextContinuationData", @"continuation"]) : nil;
+        if (![token length]) return norm;
+        // the section the extra videos go into: the first one that already holds several videos
+        NSMutableArray *target = nil;
+        NSMutableSet *seen = [NSMutableSet set];
+        NSMutableArray *secs = [NSMutableArray array];
+        TRCollectAll(sl, @"itemSectionRenderer", secs, 0);
+        for (id sec in secs) {
+            NSMutableArray *cs = ([sec isKindOfClass:[NSMutableDictionary class]] && [sec[@"contents"] isKindOfClass:[NSMutableArray class]]) ? sec[@"contents"] : nil;
+            if (!cs) continue;
+            NSUInteger nv = 0;
+            for (id it in cs) {
+                NSDictionary *cv = [it isKindOfClass:[NSDictionary class]] ? it[@"compactVideoRenderer"] : nil;
+                if ([cv isKindOfClass:[NSDictionary class]] && [cv[@"videoId"] length]) { nv++; [seen addObject:cv[@"videoId"]]; }
+            }
+            if (!target && nv >= 4) target = cs;
+        }
+        if (!target) return norm;
+        NSUInteger added = 0;
+        for (NSUInteger p = 0; p < kTRHomeExtraPages && [token length]; p++) {
+            __block NSDictionary *cj = nil;
+            dispatch_semaphore_t sem = dispatch_semaphore_create(0);
+            TRPostInnerTube(@"browse", @{ @"continuation": token }, ^(NSDictionary *j, NSInteger c, NSError *e) {
+                if (j && c < 400) cj = [j retain];
+                dispatch_semaphore_signal(sem);
+            });
+            long timedOut = dispatch_semaphore_wait(sem, dispatch_time(DISPATCH_TIME_NOW, 6 * NSEC_PER_SEC));
+            dispatch_release(sem);
+            if (timedOut || !cj) break;
+            for (NSDictionary *v in TRVideosOf(TRNormalizeResponse(cj))) {
+                if ([seen containsObject:v[@"videoId"]]) continue;
+                [seen addObject:v[@"videoId"]];
+                [target addObject:@{ @"compactVideoRenderer": v }];
+                added++;
+            }
+            NSMutableArray *cir = [NSMutableArray array];
+            TRCollectAll(cj, @"continuationItemRenderer", cir, 0);
+            NSString *next = nil;
+            for (id ci in cir) { id t = TRDig(ci, @[@"continuationEndpoint", @"continuationCommand", @"token"]); if ([t isKindOfClass:[NSString class]]) next = t; }
+            [cj release];
+            token = next;
+        }
+        // scrolling carries on after the merged pages
+        if ([token length]) sl[@"continuations"] = TRContinuations(token); else [sl removeObjectForKey:@"continuations"];
+        NSLog(@"[TubeReplacer] home feed: merged %lu extra video(s)", (unsigned long)added);
+        return added ? mn : norm;
+    } @catch (NSException *e) { return norm; }
+}
+
+// Keep only a few Mix playlists, then mix the order of the recommended videos (the server often returns the same list).
 static NSDictionary *TRShuffleHomeVideos(NSDictionary *norm) {
     @try {
         NSData *jd = [NSJSONSerialization dataWithJSONObject:norm options:0 error:nil];
@@ -3286,10 +3352,21 @@ static NSDictionary *TRShuffleHomeVideos(NSDictionary *norm) {
         if (![mn isKindOfClass:[NSMutableDictionary class]]) return norm;
         NSMutableArray *secs = [NSMutableArray array];
         TRCollectAll(mn, @"itemSectionRenderer", secs, 0);
-        NSUInteger shuffled = 0;
+        NSUInteger shuffled = 0, mixesSeen = 0, mixesDropped = 0;
         for (id sec in secs) {
             NSMutableArray *cs = ([sec isKindOfClass:[NSMutableDictionary class]] && [sec[@"contents"] isKindOfClass:[NSMutableArray class]]) ? sec[@"contents"] : nil;
             if (!cs) continue;
+            // mixes: radio renderers and RD... playlists
+            NSMutableIndexSet *drop = [NSMutableIndexSet indexSet];
+            for (NSUInteger i = 0; i < [cs count]; i++) {
+                id it = [cs objectAtIndex:i];
+                if (![it isKindOfClass:[NSDictionary class]]) continue;
+                NSDictionary *pl = it[@"compactRadioRenderer"] ?: it[@"compactPlaylistRenderer"];
+                BOOL isMix = it[@"compactRadioRenderer"] != nil || ([pl isKindOfClass:[NSDictionary class]] && [pl[@"playlistId"] hasPrefix:@"RD"]);
+                if (!isMix) continue;
+                if (++mixesSeen > kTRHomeMaxMixes) [drop addIndex:i];
+            }
+            if ([drop count]) { mixesDropped += [drop count]; [cs removeObjectsAtIndexes:drop]; }
             NSMutableArray *slots = [NSMutableArray array], *vids = [NSMutableArray array];
             for (NSUInteger i = 0; i < [cs count]; i++) {
                 id it = [cs objectAtIndex:i];
@@ -3302,8 +3379,8 @@ static NSDictionary *TRShuffleHomeVideos(NSDictionary *norm) {
             for (NSUInteger k = 0; k < [slots count]; k++) [cs replaceObjectAtIndex:[[slots objectAtIndex:k] unsignedIntegerValue] withObject:[vids objectAtIndex:k]];
             shuffled += [vids count];
         }
-        NSLog(@"[TubeReplacer] home feed: shuffled %lu recommended video(s)", (unsigned long)shuffled);
-        return shuffled ? mn : norm;
+        NSLog(@"[TubeReplacer] home feed: shuffled %lu video(s), dropped %lu of %lu mix(es)", (unsigned long)shuffled, (unsigned long)mixesDropped, (unsigned long)mixesSeen);
+        return (shuffled || mixesDropped) ? mn : norm;
     } @catch (NSException *e) { return norm; }
 }
 
@@ -3766,7 +3843,7 @@ static void TRBridgeRun(id service, NSURLRequest *httpReq, id parser, NSString *
         }
         NSDictionary *norm = TRNormalizeResponse(json);
         if (signedInReq && [endpoint isEqualToString:@"browse"] && [body[@"browseId"] isEqualToString:@"FEwhat_to_watch"] && ![body[@"continuation"] length])
-            norm = TRShuffleHomeVideos(norm);
+            norm = TRShuffleHomeVideos(TRExtendHomeFeed(norm));
         if ([endpoint isEqualToString:@"browse"] && TRIsHomeFeedId(body[@"browseId"]) && !body[@"continuation"] && !TRHasVideos(norm, 0)) {
             // Signed-out YouTube no longer serves a home feed: show the curated trending playlist instead (search as a last resort).
             NSLog(@"[TubeReplacer] bridge browse: home feed is empty when signed out, using the trending playlist");
