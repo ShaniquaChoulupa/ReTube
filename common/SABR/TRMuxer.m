@@ -100,12 +100,33 @@ typedef struct { uint8_t track; uint32_t first, count; uint64_t src; uint32_t si
     NSString *paths[2];
     NSString *ua;
     uint64_t srcEnd[2];
+    NSDictionary *(^refresh)(void);   // optional: fresh @{ video, audio } links when YouTube cuts the old ones off
+    int refreshes;
 }
+- (NSString *)urlForTrack:(int)t;
+- (void)refreshTrack:(int)t staleURL:(NSString *)stale;
 @end
 @implementation TRMuxPlan
 - (void)dealloc {
     for (int i = 0; i < 2; i++) if (paths[i]) [[NSFileManager defaultManager] removeItemAtPath:paths[i] error:nil];
-    [header release]; free(chunks); [urls[0] release]; [urls[1] release]; [paths[0] release]; [paths[1] release]; [ua release]; [super dealloc];
+    [header release]; free(chunks); [urls[0] release]; [urls[1] release]; [paths[0] release]; [paths[1] release]; [ua release]; [refresh release]; [super dealloc];
+}
+- (NSString *)urlForTrack:(int)t { @synchronized(self) { return [[urls[t] retain] autorelease]; } }
+// Links without a PO token stop working after about a minute of data: ask for new ones (one caller at a time; a caller that
+// finds the link already replaced by another one just retries).
+- (void)refreshTrack:(int)t staleURL:(NSString *)stale {
+    @synchronized(self) {
+        if (!refresh || refreshes >= 20) return;
+        if (![urls[t] isEqual:stale]) return;
+        refreshes++;
+        NSDictionary *r = refresh();
+        NSString *nv = r[@"video"], *na = r[@"audio"];
+        if ([nv length] && [na length]) {
+            [urls[0] release]; urls[0] = [nv copy];
+            [urls[1] release]; urls[1] = [na copy];
+            NSLog(@"[TubeReplacer] mux: fresh stream links (refresh %d)", refreshes);
+        } else NSLog(@"[TubeReplacer] mux: could not get fresh stream links");
+    }
 }
 @end
 
@@ -498,12 +519,19 @@ static TRMuxTrack *LoadTrackLocal(NSData *initData, NSArray *frags, NSString *pa
 - (void)fetchTrack:(int)t from:(uint64_t)src length:(uint64_t)len {
     inflight[t] = YES;
     uint64_t end = MIN(src + len, plan->srcEnd[t]);
-    NSString *url = plan->urls[t];
     NSString *ua = plan->ua;
     [self retain];
     dispatch_async(dispatch_get_global_queue(DISPATCH_QUEUE_PRIORITY_DEFAULT, 0), ^{
         NSInteger code = 0;
-        NSData *d = RangeGET(url, ua, src, end - 1, &code);
+        NSData *d = nil;
+        for (int attempt = 0; attempt < 3; attempt++) {
+            NSString *url = [plan urlForTrack:t];
+            d = RangeGET(url, ua, src, end - 1, &code);
+            if ((code == 200 || code == 206) && [d length]) break;
+            NSLog(@"[TubeReplacer] mux: track %d http %ld at byte %llu, attempt %d", t, (long)code, src, attempt + 1);
+            if (plan->refresh && attempt < 2) [plan refreshTrack:t staleURL:url];
+            else if (attempt < 2) [NSThread sleepForTimeInterval:0.5];
+        }
         @synchronized(self) {
             inflight[t] = NO;
             if ((code == 200 || code == 206) && [d length]) {
@@ -789,6 +817,22 @@ NSDictionary *TRMuxCreate(NSDictionary *video, NSDictionary *audio, NSString *ua
     if (!EnsureServer()) { if (why) *why = @"no local server"; return nil; }
     TRMuxPlan *plan = BuildPlan(video, audio, ua, &reason);
     if (!plan) { if (why) *why = reason; return nil; }
+    NSString *name = [NSString stringWithFormat:@"%08x%08x", arc4random(), arc4random()];
+    @synchronized([TRMuxConnection class]) {
+        gPlans[name] = plan; [gPlanOrder addObject:name];
+        while ([gPlanOrder count] > 8) { [gPlans removeObjectForKey:gPlanOrder[0]]; [gPlanOrder removeObjectAtIndex:0]; }
+    }
+    return @{ @"url": [NSString stringWithFormat:@"http://127.0.0.1:%u/m/%@.mp4", gPort, name],
+              @"length": @(plan->total) };
+}
+
+// Like TRMuxCreate, with a way to get new stream links when YouTube stops serving the old ones (blocking block, may be slow).
+NSDictionary *TRMuxCreateRefreshing(NSDictionary *video, NSDictionary *audio, NSString *ua, NSDictionary *(^refresh)(void), NSString **why) {
+    NSString *reason = nil;
+    if (!EnsureServer()) { if (why) *why = @"no local server"; return nil; }
+    TRMuxPlan *plan = BuildPlan(video, audio, ua, &reason);
+    if (!plan) { if (why) *why = reason; return nil; }
+    plan->refresh = [refresh copy];
     NSString *name = [NSString stringWithFormat:@"%08x%08x", arc4random(), arc4random()];
     @synchronized([TRMuxConnection class]) {
         gPlans[name] = plan; [gPlanOrder addObject:name];

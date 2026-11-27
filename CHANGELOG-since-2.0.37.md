@@ -1,5 +1,10 @@
+# ReTube 1.4 (on top of 1.3)
+- 720p reworked: the iPhone-client HLS list is gone (YouTube answers `hls=no`), so the 720p H.264 video-only + AAC audio-only streams of the android client (fallback: android VR client) are merged locally by TRMuxer into one MP4 (itag 22 entry next to the 360p one). Links are probed first; TRMuxCreateRefreshing re-fetches the player response and swaps in new links when YouTube answers 403 mid-playback. Videos over 25 minutes and live streams are skipped. Failures count (3 in a row pause HD for 5 min).
+- Suggested videos: the "more" token is searched in the whole list (signed-in answers wrap it), extra items are appended to the same list; log line when no token is found.
+- Tiles: also hooks YTCompactSuggestedVideoCell / YTCompactVideoCell / YTSuggestedVideoCell (layoutSubviews + sizeThatFits, outermost call only); finds the picture anywhere below the cell; dumps the first 4 view trees to the log.
+
 # ReTube 1.3 (on top of TubeReplacer 2.0.73 + ReTube 1.2)
-- 720p: iPhone-client HLS list sanitized (avc1/mp4a, 240p-720p, best first, one default audio track per group), probed (list + first segment), served locally; fallback to the normal 360p; settings switch EnableHD.
+- (HLS 720p, replaced in 1.4.)
 - Suggested videos: two continuation pages of the watch-next list are followed (cap 40 -> 90, duplicates removed).
 - Suggested-video tiles ~25% larger when the row has room (YTCompactVideoView), settings switch BigTiles; layout dump of the first rows in the log.
 

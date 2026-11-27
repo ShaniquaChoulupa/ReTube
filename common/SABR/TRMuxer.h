@@ -6,6 +6,8 @@
 // Returns @{ @"url": local URL, @"length": total bytes, @"seconds": duration } or nil with *why set.
 NSDictionary *TRMuxCreate(NSDictionary *video, NSDictionary *audio, NSString *ua, NSString **why);
 
+NSDictionary *TRMuxCreateRefreshing(NSDictionary *video, NSDictionary *audio, NSString *ua, NSDictionary *(^refresh)(void), NSString **why);
+
 NSString *TRMuxLazyURL(NSDictionary *video, NSDictionary *audio, NSString *ua);
 
 NSString *TRMuxStartLocalJob(NSString *label, NSDictionary *(^job)(NSString **why));

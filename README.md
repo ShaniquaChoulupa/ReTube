@@ -1,11 +1,15 @@
-# ReTube 1.3
+# ReTube 1.4
 
-**New in 1.3**
-- **720p playback.** Videos start on the iPhone app's HLS stream list (H.264 + AAC, 240p up to 720p, best first) instead of the single 360p file. YouTube is asked in the background while the normal 360p request runs; the stream is checked before it is used, and if YouTube refuses it (or anything goes wrong) the video plays at 360p like before. (If a video will not play at all after this update, switch "720p HD playback" off.) Three failures in a row pause HD for 5 minutes. Switch: Settings > ReTube > "720p HD playback" (also needs "Enable HLS" on). The quality picker still applies: with 720p off in it, the cap drops to 480p, then 360p. 1080p is left out on purpose.
-- **More suggested videos.** The watch page now follows the suggestions list for two extra pages (about three times as many videos, duplicates removed) instead of stopping at the first ~20.
-- **Bigger video tiles (best effort).** The picture in the suggested-video rows is made about 25% larger when the row can hold it. If the app lays rows out in a way this cannot reach, nothing changes. The first three rows are described in TubeReplacer.log ("tile #1 ...") so it can be done exactly next time. Switch: "Bigger video tiles".
+**New in 1.4 (fixes for 1.3)**
+- **720p playback, new method.** 1.3 asked YouTube for the iPhone app's HLS list; YouTube no longer gives that list out for normal videos, so 720p could never start. Now ReTube takes YouTube's separate 720p video (H.264) and audio (AAC) streams and joins them into one ordinary MP4 on the iPad itself (no re-encoding, served from 127.0.0.1), then offers it next to the 360p stream. The links are tested first; if YouTube refuses them, or the merge fails, the video plays at 360p like before. YouTube cuts these links off after about a minute, so the merge asks for new links by itself while you watch. Videos longer than 25 minutes are not merged (they play at 360p). Switch: Settings > ReTube > "720p HD playback"; the quality picker's 720p switch still applies. 1080p is left out on purpose. Starting a video can take a few seconds longer while the merge is prepared.
+- **Suggested videos, signed in.** The extra suggestions from 1.3 only appeared when signed out; the list is now found in signed-in answers too.
+- **Bigger video tiles.** 1.3 hooked a row class this YouTube version does not use. 1.4 also hooks the cell classes of the suggested rows and writes what they look like to the log, so it can be done exactly if the guess does nothing.
 
-Log lines to look for: `hd:` (720p), `related:` (extra suggestions), `tile #` (row layout).
+**From 1.3**
+- More suggested videos (two extra pages, duplicates removed, up to 90).
+- "Bigger video tiles" switch.
+
+Log lines to look for in /var/mobile/Documents/TubeReplacer.log: `hd:` (720p: which client, link tests, merge result), `mux:` (stream links refreshed or refused while playing), `related:` (extra suggestions), `tile #` (row layout).
 
 ---
 

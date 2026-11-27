@@ -1,6 +1,6 @@
 Package: com.retube.lol
 Name: ReTube
-Version: 1.3
+Version: 1.4
 Architecture: iphoneos-arm
 Description: A fix for YouTube with sign-in. Based on TubeReplacer by Preloading (GPLv3).
 Maintainer: Jeremy

@@ -87,25 +87,44 @@ static BOOL TRBigTilesOn(void) {
     return on;
 }
 
-// What the row looks like (first few rows only): the log tells how to size the tiles properly if the guess below does nothing.
-static void TRTileDump(UIView *row) {
-    static int n = 0;
-    if (n >= 3) return;
-    n++;
-    NSMutableString *d = [NSMutableString stringWithFormat:@"[TubeReplacer] tile #%d: %@ %@", n, NSStringFromClass([row class]), NSStringFromCGRect(row.frame)];
-    UIView *up = row.superview;
-    for (int i = 0; up && i < 3; i++, up = up.superview) [d appendFormat:@" < %@ %@", NSStringFromClass([up class]), NSStringFromCGRect(up.frame)];
-    for (UIView *v in row.subviews) {
-        [d appendFormat:@"\n    %@ %@ hidden=%d", NSStringFromClass([v class]), NSStringFromCGRect(v.frame), v.hidden];
-        for (UIView *w in v.subviews) [d appendFormat:@"\n        %@ %@", NSStringFromClass([w class]), NSStringFromCGRect(w.frame)];
+// What a cell looks like (first few only): the log tells how to size the tiles properly if the guess below does nothing.
+static void TRTileDumpTree(UIView *v, int depth, NSMutableString *d) {
+    if (depth > 4) return;
+    NSString *pad = [@"" stringByPaddingToLength:(NSUInteger)(depth * 2 + 4) withString:@" " startingAtIndex:0];
+    for (UIView *s in v.subviews) {
+        [d appendFormat:@"\n%@%@ %@%@", pad, NSStringFromClass([s class]), NSStringFromCGRect(s.frame), s.hidden ? @" hidden" : @""];
+        TRTileDumpTree(s, depth + 1, d);
     }
+}
+static void TRTileDump(UIView *root, NSString *tag) {
+    static int n = 0;
+    if (n >= 4 || root.bounds.size.width < 50 || root.bounds.size.height < 30) return;
+    n++;
+    NSMutableString *d = [NSMutableString stringWithFormat:@"[TubeReplacer] tile #%d (%@): %@ %@", n, tag, NSStringFromClass([root class]), NSStringFromCGRect(root.frame)];
+    UIView *up = root.superview;
+    for (int i = 0; up && i < 3; i++, up = up.superview) [d appendFormat:@" < %@ %@", NSStringFromClass([up class]), NSStringFromCGRect(up.frame)];
+    TRTileDumpTree(root, 0, d);
     NSLog(@"%@", d);
+}
+
+static BOOL TRIsThumbShape(UIView *v, CGFloat rowW) {
+    CGRect f = v.frame;
+    if (v.hidden || f.size.height < 40 || f.size.width < 70 || f.size.width > rowW * 0.65) return NO;
+    CGFloat ar = f.size.width / f.size.height;
+    return ar >= 1.5 && ar <= 1.95;
+}
+// The view (the root or something below it) that has the picture as a direct child.
+static UIView *TRFindTileRow(UIView *root, int depth) {
+    CGFloat w = root.bounds.size.width;
+    for (UIView *v in root.subviews) if (TRIsThumbShape(v, w)) return root;
+    if (depth >= 4) return nil;
+    for (UIView *v in root.subviews) { UIView *r = TRFindTileRow(v, depth + 1); if (r) return r; }
+    return nil;
 }
 
 static void TRBigTile(UIView *row) {
     @try {
         if (!TRBigTilesOn()) return;
-        TRTileDump(row);
         CGRect rb = row.bounds;
         // the picture: the biggest direct child with a video-like shape
         UIView *thumb = nil; CGFloat best = 0;
@@ -151,18 +170,60 @@ static void TRBigTile(UIView *row) {
     } @catch (NSException *e) {}
 }
 
+static void TRBigTileIn(UIView *root, NSString *tag) {
+    @try {
+        if (!TRBigTilesOn()) return;
+        TRTileDump(root, tag);
+        UIView *row = TRFindTileRow(root, 0);
+        if (row) TRBigTile(row);
+    } @catch (NSException *e) {}
+}
+static BOOL gTRInSize = NO;
+static CGSize TRBigTileSize(CGSize r) {
+    if (r.height > 50.0 && r.height < 300.0 && TRBigTilesOn()) r.height += floor((r.height - 16.0) * (kTRTileScale - 1.0));
+    return r;
+}
+
 %hook YTCompactVideoView
 - (void)layoutSubviews {
     if (TRPadV1112() && [self respondsToSelector:@selector(layoutSubviews_compact)]) {
         CGFloat w = ((UIView *)self).bounds.size.width;
-        if (w > 0 && w < 520) { ((void (*)(id, SEL))objc_msgSend)(self, @selector(layoutSubviews_compact)); TRBigTile((UIView *)self); return; }
+        if (w > 0 && w < 520) { ((void (*)(id, SEL))objc_msgSend)(self, @selector(layoutSubviews_compact)); TRBigTileIn((UIView *)self, @"YTCompactVideoView"); return; }
     }
     %orig;
-    TRBigTile((UIView *)self);
+    TRBigTileIn((UIView *)self, @"YTCompactVideoView");
 }
 - (CGSize)sizeThatFits:(CGSize)size {
-    CGSize r = %orig;
-    if (r.height > 50.0 && r.height < 300.0 && TRBigTilesOn()) r.height += floor((r.height - 16.0) * (kTRTileScale - 1.0));
-    return r;
+    if (gTRInSize) return %orig;                  // only the outermost call (view inside cell, subclass inside superclass) adds the height
+    gTRInSize = YES; CGSize r = %orig; gTRInSize = NO;
+    return TRBigTileSize(r);
+}
+%end
+
+// 12.x draws the suggestions with these cells (the view above is not always the one that gets laid out)
+%hook YTCompactSuggestedVideoCell
+- (void)layoutSubviews { %orig; TRBigTileIn((UIView *)self, @"YTCompactSuggestedVideoCell"); }
+- (CGSize)sizeThatFits:(CGSize)size {
+    if (gTRInSize) return %orig;                  // only the outermost call (view inside cell, subclass inside superclass) adds the height
+    gTRInSize = YES; CGSize r = %orig; gTRInSize = NO;
+    return TRBigTileSize(r);
+}
+%end
+
+%hook YTCompactVideoCell
+- (void)layoutSubviews { %orig; TRBigTileIn((UIView *)self, @"YTCompactVideoCell"); }
+- (CGSize)sizeThatFits:(CGSize)size {
+    if (gTRInSize) return %orig;                  // only the outermost call (view inside cell, subclass inside superclass) adds the height
+    gTRInSize = YES; CGSize r = %orig; gTRInSize = NO;
+    return TRBigTileSize(r);
+}
+%end
+
+%hook YTSuggestedVideoCell
+- (void)layoutSubviews { %orig; TRBigTileIn((UIView *)self, @"YTSuggestedVideoCell"); }
+- (CGSize)sizeThatFits:(CGSize)size {
+    if (gTRInSize) return %orig;                  // only the outermost call (view inside cell, subclass inside superclass) adds the height
+    gTRInSize = YES; CGSize r = %orig; gTRInSize = NO;
+    return TRBigTileSize(r);
 }
 %end
