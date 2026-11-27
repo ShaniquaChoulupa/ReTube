@@ -1082,10 +1082,15 @@ static void TRTranslateWatchNextModern(NSMutableDictionary *r) {
     NSMutableArray *related = [NSMutableArray array];
     id sec = tcol[@"secondaryResults"];
     NSMutableArray *stack = sec ? [NSMutableArray arrayWithObject:sec] : [NSMutableArray array];
-    while ([stack count] && [related count] < 40) {
+    NSMutableSet *seenRel = [NSMutableSet set];
+    while ([stack count] && [related count] < 90) {
         id n = [stack objectAtIndex:0]; [stack removeObjectAtIndex:0];
         if ([n isKindOfClass:[NSDictionary class]]) {
-            if (n[@"compactVideoRenderer"]) { [related addObject:@{ @"compactVideoRenderer": n[@"compactVideoRenderer"] }]; continue; }
+            if (n[@"compactVideoRenderer"]) {
+                NSString *rvid = [n[@"compactVideoRenderer"] isKindOfClass:[NSDictionary class]] ? n[@"compactVideoRenderer"][@"videoId"] : nil;
+                if ([rvid length]) { if ([seenRel containsObject:rvid]) continue; [seenRel addObject:rvid]; }
+                [related addObject:@{ @"compactVideoRenderer": n[@"compactVideoRenderer"] }]; continue;
+            }
             [stack addObjectsFromArray:[n allValues]];
         } else if ([n isKindOfClass:[NSArray class]]) [stack addObjectsFromArray:n];
     }
@@ -1158,10 +1163,15 @@ static void TRTranslateWatchNextLegacy(NSMutableDictionary *r) {
     NSMutableArray *related = [NSMutableArray array];
     id sec = tcol[@"secondaryResults"];
     NSMutableArray *stack = sec ? [NSMutableArray arrayWithObject:sec] : [NSMutableArray array];
-    while ([stack count] && [related count] < 40) {
+    NSMutableSet *seenRel = [NSMutableSet set];
+    while ([stack count] && [related count] < 90) {
         id n = [stack objectAtIndex:0]; [stack removeObjectAtIndex:0];
         if ([n isKindOfClass:[NSDictionary class]]) {
-            if (n[@"compactVideoRenderer"]) { [related addObject:@{ @"compactVideoRenderer": n[@"compactVideoRenderer"] }]; continue; }
+            if (n[@"compactVideoRenderer"]) {
+                NSString *rvid = [n[@"compactVideoRenderer"] isKindOfClass:[NSDictionary class]] ? n[@"compactVideoRenderer"][@"videoId"] : nil;
+                if ([rvid length]) { if ([seenRel containsObject:rvid]) continue; [seenRel addObject:rvid]; }
+                [related addObject:@{ @"compactVideoRenderer": n[@"compactVideoRenderer"] }]; continue;
+            }
             [stack addObjectsFromArray:[n allValues]];
         } else if ([n isKindOfClass:[NSArray class]]) [stack addObjectsFromArray:n];
     }
@@ -2908,6 +2918,357 @@ static void TRPrepareLive(NSDictionary *json0, void (^proceed)(NSDictionary *)) 
     }];
 }
 
+#pragma mark - 720p: the iPhone app's HLS list, trimmed for the old apps (ReTube 1.3)
+
+// The android client only hands out one muxed 360p file. The iPhone client also gives an HLS list with 144p-1080p H.264 steps.
+// This fetches that list in parallel with the normal player request, keeps the H.264/AAC steps up to the quality cap,
+// checks that YouTube really serves the segments to this device (HLS is served by googlevideo, which may refuse), and hands
+// the app a local copy of the list. On any failure the video simply plays as before (360p).
+static NSString *const kTRHDiOSUA = @"com.google.ios.youtube/21.08.3 (iPhone16,2; U; CPU iOS 18_5 like Mac OS X;)";
+
+static NSDictionary *TRHDPrefs(void) {
+    return [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/dev.preloading.tubereplacer.preferences.plist"];
+}
+
+// Highest picture height to allow; 0 = no HD (switch off, custom stream server, or the 360p stream is all the quality picker allows).
+static int TRHDMaxHeight(void) {
+    if (majorVersion() < 10) return 0;
+    NSDictionary *p = TRHDPrefs();
+    if (p[@"EnableHD"] && ![p[@"EnableHD"] boolValue]) return 0;
+    if (p[@"AllowHLS"] && ![p[@"AllowHLS"] boolValue]) return 0;
+    NSString *st = p[@"StreamType"];
+    if ([st isEqualToString:@"tuberepair"] || [st isEqualToString:@"custom"]) return 0;
+    if (!p[@"allowquality_hd720"] || [p[@"allowquality_hd720"] boolValue]) return 720; // 720p is the top step of this build
+    if (!p[@"allowquality_large"] || [p[@"allowquality_large"] boolValue]) return 480;
+    return 0;
+}
+
+@interface TRHDJob : NSObject {
+@public
+    BOOL finished;
+    NSString *result;
+    NSMutableArray *waiters;
+    NSTimeInterval started;
+}
+@end
+@implementation TRHDJob
+- (id)init { if ((self = [super init])) { waiters = [[NSMutableArray alloc] init]; started = [NSDate timeIntervalSinceReferenceDate]; } return self; }
+- (void)dealloc { [result release]; [waiters release]; [super dealloc]; }
+@end
+
+static NSMutableDictionary *gTRHDJobs = nil;
+static NSTimeInterval gTRHDOffUntil = 0;
+static int gTRHDFails = 0;
+
+static void TRHDFinish(TRHDJob *job, NSString *url, NSString *why, BOOL countFailure) {
+    NSArray *ws = nil;
+    @synchronized (job) {
+        if (job->finished) return;
+        job->finished = YES;
+        job->result = [url copy];
+        ws = [job->waiters copy];
+        [job->waiters removeAllObjects];
+    }
+    @synchronized ([TRHDJob class]) {
+        if (url) gTRHDFails = 0;
+        else if (countFailure && ++gTRHDFails >= 3) { gTRHDFails = 0; gTRHDOffUntil = [NSDate timeIntervalSinceReferenceDate] + 300; NSLog(@"[TubeReplacer] hd: three failures in a row, HD paused for 5 minutes"); }
+    }
+    NSLog(@"[TubeReplacer] hd: %@%@", why, url ? [@" -> " stringByAppendingString:url] : @"");
+    for (id w in ws) ((void (^)(NSString *))w)(url);
+    [ws release];
+}
+
+// Waits (up to `timeout` seconds) for the job; cb gets the local list URL or nil. Called exactly once.
+static void TRHDWait(TRHDJob *job, double timeout, void (^cb)(NSString *url)) {
+    if (!job) { cb(nil); return; }
+    __block BOOL fired = NO;
+    void (^once)(NSString *) = [^(NSString *u) {
+        BOOL go;
+        @synchronized (job) { go = !fired; fired = YES; }
+        if (go) cb(u);
+    } copy];
+    BOOL doneNow; NSString *res;
+    @synchronized (job) { doneNow = job->finished; res = job->result; if (!doneNow) [job->waiters addObject:once]; }
+    if (doneNow) once(res);
+    else dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(timeout * NSEC_PER_SEC)), dispatch_get_global_queue(0, 0), ^{
+        BOOL late; @synchronized (job) { late = !fired; }
+        if (late) NSLog(@"[TubeReplacer] hd: no answer in time, playing the normal stream");
+        once(nil);
+    });
+    [once release];
+}
+
+// Master list of the iPhone client -> a small, plain one: H.264 + AAC only, up to maxH, one step per height (30 fps preferred),
+// best first (the player starts on the first step), one default audio track per group, no subtitle/I-frame/HDR extras.
+static NSString *TRSanitizeMasterH(NSString *text, NSURL *base, int maxH, int *topH, NSString **videoList, NSString **audioList, NSString **info) {
+    BOOL highOK = YES;
+    Class sc = NSClassFromString(@"TRSabrStream");
+    if (sc && [sc respondsToSelector:@selector(canPlayH264HighProfile)]) highOK = ((BOOL (*)(id, SEL))objc_msgSend)(sc, @selector(canPlayH264HighProfile));
+    NSMutableDictionary *groups = [NSMutableDictionary dictionary]; // group id -> @{ uri, def }
+    NSMutableArray *vars = [NSMutableArray array];
+    NSDictionary *pending = nil; BOOL havePending = NO;
+    for (NSString *raw in [text componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+        NSString *l = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+        if (![l length] || [l hasPrefix:@"#EXTM3U"]) continue;
+        if ([l hasPrefix:@"#EXT-X-MEDIA:"]) {
+            NSString *at = [l substringFromIndex:13];
+            if (![[TRSplitAttr(at, @"TYPE") uppercaseString] isEqualToString:@"AUDIO"]) continue;
+            NSString *gid = TRSplitAttr(at, @"GROUP-ID"), *uri = TRSplitAttr(at, @"URI");
+            if (![gid length] || ![uri length]) continue;
+            BOOL def = [[TRSplitAttr(at, @"DEFAULT") uppercaseString] isEqualToString:@"YES"];
+            NSDictionary *cur = groups[gid];
+            if (!cur || (def && ![cur[@"def"] boolValue])) groups[gid] = @{ @"uri": TRAbsURL(uri, base), @"def": @(def) };
+            continue;
+        }
+        if ([l hasPrefix:@"#EXT-X-STREAM-INF:"]) {
+            NSString *at = [l substringFromIndex:18];
+            NSString *codecs = TRSplitAttr(at, @"CODECS") ?: @"";
+            NSString *res = TRSplitAttr(at, @"RESOLUTION");
+            NSString *range = TRSplitAttr(at, @"VIDEO-RANGE");
+            int h = [[[res componentsSeparatedByString:@"x"] lastObject] intValue];
+            BOOL ok = [codecs rangeOfString:@"avc1"].location != NSNotFound && [codecs rangeOfString:@"mp4a"].location != NSNotFound
+                && [codecs rangeOfString:@"vp09"].location == NSNotFound && [codecs rangeOfString:@"av01"].location == NSNotFound
+                && [codecs rangeOfString:@"hvc1"].location == NSNotFound && [codecs rangeOfString:@"hev1"].location == NSNotFound
+                && [codecs rangeOfString:@"dvh1"].location == NSNotFound
+                && h >= 240 && h <= maxH && (![range length] || [range isEqualToString:@"SDR"])
+                && (highOK || [codecs rangeOfString:@"avc1.64"].location == NSNotFound);
+            pending = ok ? @{ @"codecs": codecs, @"res": res ?: @"", @"h": @(h), @"bw": @([TRSplitAttr(at, @"BANDWIDTH") longLongValue]),
+                              @"fr": @([TRSplitAttr(at, @"FRAME-RATE") doubleValue]), @"audio": TRSplitAttr(at, @"AUDIO") ?: @"" } : nil;
+            havePending = YES;
+            continue;
+        }
+        if ([l hasPrefix:@"#"]) continue;
+        if (havePending && pending) {
+            NSMutableDictionary *v = [NSMutableDictionary dictionaryWithDictionary:pending];
+            v[@"url"] = TRAbsURL(l, base);
+            [vars addObject:v];
+        }
+        pending = nil; havePending = NO;
+    }
+    // a step that names an audio group needs that group
+    NSMutableArray *usable = [NSMutableArray array];
+    for (NSDictionary *v in vars) { NSString *g = v[@"audio"]; if (![g length] || groups[g]) [usable addObject:v]; }
+    // one step per height: 30 fps (or less) before 60 fps, then the larger bitrate
+    NSMutableDictionary *byH = [NSMutableDictionary dictionary];
+    for (NSDictionary *v in usable) {
+        NSDictionary *cur = byH[v[@"h"]];
+        BOOL lo = [v[@"fr"] doubleValue] <= 30.5, curLo = [cur[@"fr"] doubleValue] <= 30.5;
+        if (!cur || (lo && !curLo) || (lo == curLo && [v[@"bw"] longLongValue] > [cur[@"bw"] longLongValue])) byH[v[@"h"]] = v;
+    }
+    NSArray *steps = [[byH allValues] sortedArrayUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) { return [b[@"h"] compare:a[@"h"]]; }];
+    if (![steps count]) return nil;
+    NSMutableString *out = [NSMutableString stringWithString:@"#EXTM3U\n"];
+    NSMutableArray *usedGroups = [NSMutableArray array];
+    for (NSDictionary *v in steps) { NSString *g = v[@"audio"]; if ([g length] && ![usedGroups containsObject:g]) [usedGroups addObject:g]; }
+    for (NSString *g in usedGroups)
+        [out appendFormat:@"#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID=\"%@\",NAME=\"Default\",DEFAULT=YES,AUTOSELECT=YES,URI=\"%@\"\n", g, groups[g][@"uri"]];
+    NSMutableArray *names = [NSMutableArray array];
+    for (NSDictionary *v in steps) {
+        NSMutableString *a = [NSMutableString stringWithFormat:@"BANDWIDTH=%lld", [v[@"bw"] longLongValue] > 0 ? [v[@"bw"] longLongValue] : 1000000LL];
+        if ([v[@"res"] length]) [a appendFormat:@",RESOLUTION=%@", v[@"res"]];
+        [a appendFormat:@",CODECS=\"%@\"", v[@"codecs"]];
+        if ([v[@"fr"] doubleValue] > 0) [a appendFormat:@",FRAME-RATE=%@", v[@"fr"]];
+        if ([v[@"audio"] length]) [a appendFormat:@",AUDIO=\"%@\"", v[@"audio"]];
+        [out appendFormat:@"#EXT-X-STREAM-INF:%@\n%@\n", a, v[@"url"]];
+        [names addObject:[NSString stringWithFormat:@"%dp%d", [v[@"h"] intValue], (int)([v[@"fr"] doubleValue] + 0.5)]];
+    }
+    if (topH) *topH = [steps[0][@"h"] intValue];
+    if (videoList) *videoList = steps[0][@"url"];
+    if (audioList) *audioList = [usedGroups count] ? groups[usedGroups[0]][@"uri"] : nil;
+    if (info) *info = [names componentsJoinedByString:@" "];
+    return out;
+}
+
+// Does YouTube serve this step to this device? Fetch its list and ask for 2 bytes of the first media segment.
+static void TRHDProbe(NSString *listURL, void (^cb)(BOOL ok, NSString *note)) {
+    NSURL *lu = [NSURL URLWithString:listURL];
+    if (!lu) { cb(NO, @"bad list address"); return; }
+    NSMutableURLRequest *r = [NSMutableURLRequest requestWithURL:lu cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:12];
+    [r setValue:kTRHDiOSUA forHTTPHeaderField:@"User-Agent"];
+    [NSURLConnection sendAsynchronousRequest:r queue:TRBridgeQueue() completionHandler:^(NSURLResponse *resp, NSData *d, NSError *e) {
+        NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+        NSString *txt = d ? [[[NSString alloc] initWithData:d encoding:NSUTF8StringEncoding] autorelease] : nil;
+        if (code != 200 || ![txt hasPrefix:@"#EXTM3U"]) { cb(NO, [NSString stringWithFormat:@"list http %ld", (long)code]); return; }
+        NSLog(@"[TubeReplacer] hd: media list head: %@", [txt length] > 700 ? [txt substringToIndex:700] : txt);
+        NSString *seg = nil, *map = nil;
+        for (NSString *raw in [txt componentsSeparatedByCharactersInSet:[NSCharacterSet newlineCharacterSet]]) {
+            NSString *l = [raw stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceCharacterSet]];
+            if ([l hasPrefix:@"#EXT-X-MAP:"]) { if (!map) map = TRSplitAttr([l substringFromIndex:11], @"URI"); continue; }
+            if ([l length] && ![l hasPrefix:@"#"]) { seg = l; break; }
+        }
+        if (!seg) seg = map;
+        if (![seg length]) { cb(NO, @"list has no segments"); return; }
+        NSURL *su = [NSURL URLWithString:TRAbsURL(seg, [resp URL] ?: lu)];
+        if (!su) { cb(NO, @"bad segment address"); return; }
+        NSMutableURLRequest *sr = [NSMutableURLRequest requestWithURL:su cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:12];
+        [sr setValue:@"bytes=0-1" forHTTPHeaderField:@"Range"];
+        [sr setValue:kTRHDiOSUA forHTTPHeaderField:@"User-Agent"];
+        [NSURLConnection sendAsynchronousRequest:sr queue:TRBridgeQueue() completionHandler:^(NSURLResponse *r2, NSData *d2, NSError *e2) {
+            NSInteger c2 = [r2 isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)r2 statusCode] : 0;
+            cb(c2 == 200 || c2 == 206, [NSString stringWithFormat:@"segment http %ld", (long)c2]);
+        }];
+    }];
+}
+
+static void TRHDRun(TRHDJob *job, NSString *videoID, int maxH) {
+    YoutubeClientType *ic = [YoutubeClientType iosClient];
+    NSData *b0 = [TRRequestBuilder playerBodyWithVideoId:videoID poToken:nil signatureTimestamp:nil client:ic];
+    id parsed = b0 ? [NSJSONSerialization JSONObjectWithData:b0 options:NSJSONReadingMutableContainers error:nil] : nil;
+    NSMutableDictionary *body = [parsed isKindOfClass:[NSMutableDictionary class]] ? parsed : nil;
+    id cl = body[@"context"][@"client"];
+    if (![cl isKindOfClass:[NSMutableDictionary class]]) { TRHDFinish(job, nil, @"could not build the iPhone request", NO); return; }
+    cl[@"deviceMake"] = @"Apple";
+    cl[@"deviceModel"] = @"iPhone16,2";
+    body[@"playbackContext"] = @{ @"contentPlaybackContext": @{ @"html5Preference": @"HTML5_PREF_WANTS" } };
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"https://www.youtube.com/youtubei/v1/player?prettyPrint=false&noauth=1"]
+                                                       cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:15.0];
+    [req setHTTPMethod:@"POST"];
+    [req setHTTPBody:[NSJSONSerialization dataWithJSONObject:body options:0 error:nil]];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    [req setValue:kTRHDiOSUA forHTTPHeaderField:@"User-Agent"];
+    [req setValue:@"5" forHTTPHeaderField:@"X-YouTube-Client-Name"];
+    [req setValue:@"21.08.3" forHTTPHeaderField:@"X-YouTube-Client-Version"];
+    [NSURLConnection sendAsynchronousRequest:req queue:TRBridgeQueue() completionHandler:^(NSURLResponse *resp, NSData *data, NSError *err) {
+        @try {
+            NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+            id j = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+            NSString *status = [TRDig(j, @[@"playabilityStatus", @"status"]) description];
+            id hlsv = TRDig(j, @[@"streamingData", @"hlsManifestUrl"]);
+            NSString *hls = [hlsv isKindOfClass:[NSString class]] ? hlsv : nil;
+            NSLog(@"[TubeReplacer] hd: iPhone player for %@: http=%ld status=%@ hls=%@", videoID, (long)code, status, [hls length] ? @"yes" : @"no");
+            if (![hls length]) { TRHDFinish(job, nil, @"the iPhone client gave no HLS list", code >= 400 || [status isEqualToString:@"OK"]); return; }
+            NSMutableURLRequest *mr = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:hls] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:15];
+            [mr setValue:kTRHDiOSUA forHTTPHeaderField:@"User-Agent"];
+            [NSURLConnection sendAsynchronousRequest:mr queue:TRBridgeQueue() completionHandler:^(NSURLResponse *r1, NSData *d1, NSError *e1) {
+                @try {
+                    NSInteger c1 = [r1 isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)r1 statusCode] : 0;
+                    NSString *txt = d1 ? [[[NSString alloc] initWithData:d1 encoding:NSUTF8StringEncoding] autorelease] : nil;
+                    NSLog(@"[TubeReplacer] hd: master http=%ld bytes=%lu", (long)c1, (unsigned long)[d1 length]);
+                    if (c1 != 200 || ![txt hasPrefix:@"#EXTM3U"]) { TRHDFinish(job, nil, [NSString stringWithFormat:@"master list http %ld", (long)c1], YES); return; }
+                    NSLog(@"[TubeReplacer] hd: master head: %@", [txt length] > 1500 ? [txt substringToIndex:1500] : txt);
+                    int topH = 0; NSString *vlist = nil, *alist = nil, *info = nil;
+                    NSString *clean = TRSanitizeMasterH(txt, [r1 URL] ?: [NSURL URLWithString:hls], maxH, &topH, &vlist, &alist, &info);
+                    if (!clean) { TRHDFinish(job, nil, @"no H.264/AAC step between 240p and the cap", NO); return; }
+                    if (topH <= 360) { TRHDFinish(job, nil, [NSString stringWithFormat:@"best step is %dp, the normal stream is as good", topH], NO); return; }
+                    NSLog(@"[TubeReplacer] hd: steps: %@", info);
+                    TRHDProbe(vlist, ^(BOOL okV, NSString *noteV) {
+                        if (!okV) { TRHDFinish(job, nil, [@"video list not served: " stringByAppendingString:noteV ?: @""], YES); return; }
+                        void (^ship)(void) = ^{
+                            NSString *local = TRServeText(@"m3u8", @"application/vnd.apple.mpegurl", clean);
+                            TRHDFinish(job, local, [NSString stringWithFormat:@"%@ up to %dp (%@)", videoID, topH, info], !local);
+                        };
+                        if ([alist length]) TRHDProbe(alist, ^(BOOL okA, NSString *noteA) {
+                            if (!okA) { TRHDFinish(job, nil, [@"audio list not served: " stringByAppendingString:noteA ?: @""], YES); return; }
+                            ship();
+                        });
+                        else ship();
+                    });
+                } @catch (NSException *ex) { TRHDFinish(job, nil, [NSString stringWithFormat:@"exception %@", ex], YES); }
+            }];
+        } @catch (NSException *ex) { TRHDFinish(job, nil, [NSString stringWithFormat:@"exception %@", ex], YES); }
+    }];
+}
+
+// Starts (or returns the running) HD job for a video; call at the start of the player request so it runs in parallel.
+static TRHDJob *TRStartHDJob(NSString *videoID) {
+    if (![videoID length]) return nil;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    TRHDJob *job = nil;
+    @synchronized ([TRHDJob class]) {
+        if (!gTRHDJobs) gTRHDJobs = [[NSMutableDictionary alloc] init];
+        TRHDJob *old = gTRHDJobs[videoID];
+        if (old && now - old->started < 100) return old;
+        if ([gTRHDJobs count] > 10) for (NSString *k in [gTRHDJobs allKeys]) if (now - ((TRHDJob *)gTRHDJobs[k])->started > 100) [gTRHDJobs removeObjectForKey:k];
+        job = [[[TRHDJob alloc] init] autorelease];
+        gTRHDJobs[videoID] = job;
+    }
+    int maxH = TRHDMaxHeight();
+    if (maxH <= 0) { TRHDFinish(job, nil, @"off (settings, version or custom stream server)", NO); return job; }
+    if (now < gTRHDOffUntil) { TRHDFinish(job, nil, @"paused after repeated failures", NO); return job; }
+    NSLog(@"[TubeReplacer] hd: starting for %@ (cap %dp)", videoID, maxH);
+    TRHDRun(job, videoID, maxH);
+    return job;
+}
+
+// Asked by the player endpoint once the normal answer is in: gives the local HLS list (or nothing).
+void TRFetchHDFormatsJSON(NSString *videoID, NSDictionary *primary, void (^done)(NSArray *adaptive, NSString *hls)) {
+    id fm = TRDig(primary, @[@"streamingData", @"formats"]);
+    if (!primary || [TRDig(primary, @[@"videoDetails", @"isLive"]) boolValue] || ![fm isKindOfClass:[NSArray class]] || ![fm count]) { done(nil, nil); return; }
+    TRHDWait(TRStartHDJob(videoID), 8.0, ^(NSString *url) { done(nil, url); });
+}
+
+
+#pragma mark - More suggested videos (ReTube 1.3)
+
+// The watch page carries ~20 suggestions; the rest sits behind a "continuation". Follow it for a couple of pages and put the
+// items into the same list, so the normal translation picks them all up. Blocking (runs on the bridge's worker thread).
+static NSDictionary *TRPostInnerTubeSync(NSString *endpoint, NSDictionary *body, NSTimeInterval timeout) {
+    YoutubeClientType *client = [YoutubeClientType webClient];
+    NSMutableDictionary *full = [NSMutableDictionary dictionaryWithObject:[client makeContext] forKey:@"context"];
+    [full addEntriesFromDictionary:body];
+    NSString *u = [NSString stringWithFormat:@"https://www.youtube.com/youtubei/v1/%@?key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8&prettyPrint=false", endpoint];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:u] cachePolicy:NSURLRequestReloadIgnoringLocalCacheData timeoutInterval:timeout];
+    [req setHTTPMethod:@"POST"];
+    [req setHTTPBody:[NSJSONSerialization dataWithJSONObject:full options:0 error:nil]];
+    [req setValue:@"application/json" forHTTPHeaderField:@"Content-Type"];
+    if ([client.useragent length]) [req setValue:client.useragent forHTTPHeaderField:@"User-Agent"];
+    TRAuthorizeRequest(req);
+    NSURLResponse *resp = nil; NSError *err = nil;
+    NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+    NSInteger code = [resp isKindOfClass:[NSHTTPURLResponse class]] ? [(NSHTTPURLResponse *)resp statusCode] : 0;
+    id json = data ? [NSJSONSerialization JSONObjectWithData:data options:0 error:nil] : nil;
+    return ([json isKindOfClass:[NSDictionary class]] && code < 400) ? json : nil;
+}
+
+static NSMutableDictionary *TRCow(NSMutableDictionary *parent, NSString *key) { // copy-on-write of one dictionary level
+    id c = [parent isKindOfClass:[NSDictionary class]] ? parent[key] : nil;
+    if (![c isKindOfClass:[NSDictionary class]]) return nil;
+    NSMutableDictionary *m = [c mutableCopy];
+    parent[key] = m;
+    [m release];
+    return m;
+}
+
+static NSDictionary *TRExtendRelatedSync(NSDictionary *json, int pages) {
+    @try {
+        id res = TRDig(json, @[@"contents", @"twoColumnWatchNextResults", @"secondaryResults", @"secondaryResults", @"results"]);
+        if (![res isKindOfClass:[NSArray class]]) return json;
+        NSString *tok = nil;
+        for (id e in res) { NSString *t = TRContinuationToken(e); if ([t length]) tok = t; }
+        NSMutableArray *extra = [NSMutableArray array];
+        NSTimeInterval deadline = [NSDate timeIntervalSinceReferenceDate] + 7.0;
+        for (int i = 0; i < pages && [tok length] && [NSDate timeIntervalSinceReferenceDate] < deadline; i++) {
+            NSDictionary *cj = TRPostInnerTubeSync(@"next", @{ @"continuation": tok }, 6.0);
+            NSString *next = nil; NSUInteger before = [extra count];
+            id eps = cj[@"onResponseReceivedEndpoints"];
+            if ([eps isKindOfClass:[NSArray class]]) for (id ep in eps) {
+                id items = TRDig(ep, @[@"appendContinuationItemsAction", @"continuationItems"]);
+                if (![items isKindOfClass:[NSArray class]]) continue;
+                for (id it in items) { NSString *t = TRContinuationToken(it); if ([t length]) next = t; else [extra addObject:it]; }
+            }
+            NSLog(@"[TubeReplacer] related: page %d %@, +%lu item(s), more=%d", i + 1, cj ? @"ok" : @"failed", (unsigned long)([extra count] - before), [next length] > 0);
+            tok = next;
+            if (!cj) break;
+        }
+        if (![extra count]) return json;
+        NSMutableDictionary *root = [[json mutableCopy] autorelease];
+        NSMutableDictionary *c1 = TRCow(root, @"contents");
+        NSMutableDictionary *c2 = TRCow(c1, @"twoColumnWatchNextResults");
+        NSMutableDictionary *c3 = TRCow(c2, @"secondaryResults");
+        NSMutableDictionary *c4 = TRCow(c3, @"secondaryResults");
+        if (!c4) return json;
+        NSMutableArray *nr = [NSMutableArray array];
+        for (id e in res) if (![TRContinuationToken(e) length]) [nr addObject:e]; // the app has no use for a "load more" it cannot follow
+        [nr addObjectsFromArray:extra];
+        c4[@"results"] = nr;
+        NSLog(@"[TubeReplacer] related: %lu item(s) in the list now (was %lu)", (unsigned long)[nr count], (unsigned long)[res count]);
+        return root;
+    } @catch (NSException *e) {
+        NSLog(@"[TubeReplacer] related: extending failed: %@", e);
+        return json;
+    }
+}
+
 // Channel info (avatar etc.) for 2.3.x: the app asks for one channel per video, so share fetches.
 void TRFetchChannelJSON(NSString *channelID, void (^cb)(NSDictionary *json)) {
     static NSMutableDictionary *done = nil, *waiting = nil;
@@ -3596,6 +3957,7 @@ static void TRBridgeRun(id service, NSURLRequest *httpReq, id parser, NSString *
     if ([endpoint isEqualToString:@"player"]) {
         NSString *videoID = body[@"videoId"];
         if (![videoID length]) { completion(nil, TRError(302, @"No video id.")); return; }
+        TRStartHDJob(videoID); // 720p: runs in parallel with the normal player request, collected below
         TRFetchPlayerJSON(videoID, ^(NSDictionary *json00, NSString *failure) {
             if (!json00) { completion(nil, TRError(303, failure ?: @"No playable stream.")); return; }
             TRPrepareLive(json00, ^(NSDictionary *json0) {
@@ -3626,9 +3988,10 @@ static void TRBridgeRun(id service, NSURLRequest *httpReq, id parser, NSString *
                 NSMutableDictionary *sd = [[json0[@"streamingData"] mutableCopy] autorelease];
                 sd[@"hlsManifestUrl"] = hls;
                 [sd removeObjectForKey:@"formats"]; // the apps take a listed muxed 360p stream before the HLS one
+                [sd removeObjectForKey:@"adaptiveFormats"]; [sd removeObjectForKey:@"dashManifestUrl"];
                 mj[@"streamingData"] = sd;
                 json = mj;
-                NSLog(@"[TubeReplacer] bridge player: HD for %@ via HLS", videoID);
+                NSLog(@"[TubeReplacer] bridge player: HD for %@ via HLS (%@)", videoID, hls);
             }
             {
                 NSDictionary *sdl = [json[@"streamingData"] isKindOfClass:[NSDictionary class]] ? json[@"streamingData"] : @{};
@@ -3841,6 +4204,8 @@ static void TRBridgeRun(id service, NSURLRequest *httpReq, id parser, NSString *
             BOOL mine; @synchronized (gTRFeedTokens) { mine = [gTRFeedTokens containsObject:body[@"continuation"]]; }
             if (mine) json = TRFeedContinuationFromPlaylist(json);
         }
+        if ([endpoint isEqualToString:@"next"] && ![body[@"continuation"] length] && [body[@"videoId"] length] && [json isKindOfClass:[NSDictionary class]])
+            json = TRExtendRelatedSync(json, 2); // ReTube 1.3: two more pages of suggestions
         NSDictionary *norm = TRNormalizeResponse(json);
         if (signedInReq && [endpoint isEqualToString:@"browse"] && [body[@"browseId"] isEqualToString:@"FEwhat_to_watch"] && ![body[@"continuation"] length])
             norm = TRShuffleHomeVideos(TRExtendHomeFeed(norm));

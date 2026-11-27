@@ -71,12 +71,98 @@ static BOOL TRSend0(id o, SEL s) { return [o respondsToSelector:s] ? ((BOOL (*)(
 
 // The right column is narrow, but the regular size class picks the wide row layout (with the channel picture): the text ran
 // off the edge. Use the compact row layout whenever the row is narrow.
+// ---- bigger suggested-video tiles (ReTube 1.3, best effort) ----
+// The row's picture is made ~25% larger when the row has room for it. -sizeThatFits: asks for the extra height, and the picture
+// only grows as far as the row's real height allows, so a row the app lays out by other means is left exactly as it was.
+static const CGFloat kTRTileScale = 1.25;
+
+static BOOL TRBigTilesOn(void) {
+    static NSTimeInterval at = 0; static BOOL on = YES;
+    NSTimeInterval now = [NSDate timeIntervalSinceReferenceDate];
+    if (now - at > 3.0) {
+        at = now;
+        NSDictionary *p = [NSDictionary dictionaryWithContentsOfFile:@"/var/mobile/Library/Preferences/dev.preloading.tubereplacer.preferences.plist"];
+        on = !p[@"BigTiles"] || [p[@"BigTiles"] boolValue];
+    }
+    return on;
+}
+
+// What the row looks like (first few rows only): the log tells how to size the tiles properly if the guess below does nothing.
+static void TRTileDump(UIView *row) {
+    static int n = 0;
+    if (n >= 3) return;
+    n++;
+    NSMutableString *d = [NSMutableString stringWithFormat:@"[TubeReplacer] tile #%d: %@ %@", n, NSStringFromClass([row class]), NSStringFromCGRect(row.frame)];
+    UIView *up = row.superview;
+    for (int i = 0; up && i < 3; i++, up = up.superview) [d appendFormat:@" < %@ %@", NSStringFromClass([up class]), NSStringFromCGRect(up.frame)];
+    for (UIView *v in row.subviews) {
+        [d appendFormat:@"\n    %@ %@ hidden=%d", NSStringFromClass([v class]), NSStringFromCGRect(v.frame), v.hidden];
+        for (UIView *w in v.subviews) [d appendFormat:@"\n        %@ %@", NSStringFromClass([w class]), NSStringFromCGRect(w.frame)];
+    }
+    NSLog(@"%@", d);
+}
+
+static void TRBigTile(UIView *row) {
+    @try {
+        if (!TRBigTilesOn()) return;
+        TRTileDump(row);
+        CGRect rb = row.bounds;
+        // the picture: the biggest direct child with a video-like shape
+        UIView *thumb = nil; CGFloat best = 0;
+        for (UIView *v in row.subviews) {
+            CGRect f = v.frame;
+            if (v.hidden || f.size.height < 40 || f.size.width < 70 || f.size.width > rb.size.width * 0.65) continue;
+            CGFloat ar = f.size.width / f.size.height;
+            if (ar < 1.5 || ar > 1.95) continue;
+            if (f.size.width * f.size.height > best) { best = f.size.width * f.size.height; thumb = v; }
+        }
+        if (!thumb) return;
+        CGRect tf = thumb.frame;
+        static const char kTRTileKey = 0;
+        NSValue *was = objc_getAssociatedObject(thumb, &kTRTileKey);
+        if (was && CGRectEqualToRect([was CGRectValue], tf)) return;   // the app did not re-lay it out: already enlarged
+        CGFloat bottomPad = MAX(tf.origin.y, 4.0);
+        CGFloat room = rb.size.height - tf.origin.y - bottomPad;       // height the row can give the picture
+        CGFloat s = MIN(kTRTileScale, room / tf.size.height);
+        if (s < 1.04) return;                                           // no room: leave the row alone
+        CGFloat nw = floor(tf.size.width * s), nh = floor(tf.size.height * s);
+        CGFloat dw = nw - tf.size.width, dh = nh - tf.size.height;
+        // everything to the right of the picture moves over (and gets narrower when it ran to the edge)
+        NSMutableArray *moves = [NSMutableArray array];
+        for (UIView *v in row.subviews) {
+            if (v == thumb) continue;
+            CGRect f = v.frame;
+            if (f.origin.x >= CGRectGetMaxX(tf) - 1.0) {
+                CGRect g = f; g.origin.x += dw;
+                if (CGRectGetMaxX(f) >= rb.size.width - 24.0) g.size.width = MAX(rb.size.width - 8.0 - g.origin.x, 0);
+                if (g.size.width < 50.0 || CGRectGetMaxX(g) > rb.size.width + 1.0) return;   // would not fit: touch nothing
+                [moves addObject:@[ v, [NSValue valueWithCGRect:g] ]];
+            } else if (CGRectContainsPoint(tf, CGPointMake(CGRectGetMidX(f), CGRectGetMidY(f)))) {
+                // an overlay on the picture (length badge ...) keeps its place relative to the picture's corners
+                CGFloat fx = (CGRectGetMidX(f) - tf.origin.x) / tf.size.width, fy = (CGRectGetMidY(f) - tf.origin.y) / tf.size.height;
+                CGRect g = f; g.origin.x += dw * fx; g.origin.y += dh * fy;
+                [moves addObject:@[ v, [NSValue valueWithCGRect:g] ]];
+            }
+        }
+        for (NSArray *m in moves) ((UIView *)m[0]).frame = [m[1] CGRectValue];
+        CGRect ng = tf; ng.size.width = nw; ng.size.height = nh;
+        thumb.frame = ng;
+        objc_setAssociatedObject(thumb, &kTRTileKey, [NSValue valueWithCGRect:ng], OBJC_ASSOCIATION_RETAIN_NONATOMIC);
+    } @catch (NSException *e) {}
+}
+
 %hook YTCompactVideoView
 - (void)layoutSubviews {
     if (TRPadV1112() && [self respondsToSelector:@selector(layoutSubviews_compact)]) {
         CGFloat w = ((UIView *)self).bounds.size.width;
-        if (w > 0 && w < 520) { ((void (*)(id, SEL))objc_msgSend)(self, @selector(layoutSubviews_compact)); return; }
+        if (w > 0 && w < 520) { ((void (*)(id, SEL))objc_msgSend)(self, @selector(layoutSubviews_compact)); TRBigTile((UIView *)self); return; }
     }
     %orig;
+    TRBigTile((UIView *)self);
+}
+- (CGSize)sizeThatFits:(CGSize)size {
+    CGSize r = %orig;
+    if (r.height > 50.0 && r.height < 300.0 && TRBigTilesOn()) r.height += floor((r.height - 16.0) * (kTRTileScale - 1.0));
+    return r;
 }
 %end

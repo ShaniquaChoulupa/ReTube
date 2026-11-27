@@ -757,6 +757,20 @@
 			<key>defaults</key>
 			<string>dev.preloading.tubereplacer.preferences</string>
 			<key>key</key>
+			<string>EnableHD</string>
+			<key>label</key>
+			<string>settings.video.enable_hd</string>
+			<key>default</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>dev.preloading.tubereplacer.preferences</string>
+			<key>key</key>
 			<string>RespectBackoff</string>
 			<key>label</key>
 			<string>settings.video.respect_youtube_backoff</string>
@@ -824,6 +838,20 @@
 			<string>EnableVideoStats</string>
 			<key>label</key>
 			<string>settings.misc.allow_video_stats</string>
+			<key>default</key>
+			<true/>
+		</dict>
+		<dict>
+			<key>cell</key>
+			<string>PSSwitchCell</string>
+			<key>default</key>
+			<true/>
+			<key>defaults</key>
+			<string>dev.preloading.tubereplacer.preferences</string>
+			<key>key</key>
+			<string>BigTiles</string>
+			<key>label</key>
+			<string>settings.misc.big_tiles</string>
 			<key>default</key>
 			<true/>
 		</dict>

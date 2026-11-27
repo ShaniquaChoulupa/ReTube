@@ -1,4 +1,13 @@
-# ReTube 1.2
+# ReTube 1.3
+
+**New in 1.3**
+- **720p playback.** Videos start on the iPhone app's HLS stream list (H.264 + AAC, 240p up to 720p, best first) instead of the single 360p file. YouTube is asked in the background while the normal 360p request runs; the stream is checked before it is used, and if YouTube refuses it (or anything goes wrong) the video plays at 360p like before. (If a video will not play at all after this update, switch "720p HD playback" off.) Three failures in a row pause HD for 5 minutes. Switch: Settings > ReTube > "720p HD playback" (also needs "Enable HLS" on). The quality picker still applies: with 720p off in it, the cap drops to 480p, then 360p. 1080p is left out on purpose.
+- **More suggested videos.** The watch page now follows the suggestions list for two extra pages (about three times as many videos, duplicates removed) instead of stopping at the first ~20.
+- **Bigger video tiles (best effort).** The picture in the suggested-video rows is made about 25% larger when the row can hold it. If the app lays rows out in a way this cannot reach, nothing changes. The first three rows are described in TubeReplacer.log ("tile #1 ...") so it can be done exactly next time. Switch: "Bigger video tiles".
+
+Log lines to look for: `hd:` (720p), `related:` (extra suggestions), `tile #` (row layout).
+
+---
 
 ReTube is a rebranded build of **TubeReplacer** by Preloading (https://github.com/Preloading/TubeReplacer), licensed GPLv3. Original copyright and license are kept (see LICENSE). Package maintained by Jeremy.
 

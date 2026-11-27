@@ -1,3 +1,8 @@
+# ReTube 1.3 (on top of TubeReplacer 2.0.73 + ReTube 1.2)
+- 720p: iPhone-client HLS list sanitized (avc1/mp4a, 240p-720p, best first, one default audio track per group), probed (list + first segment), served locally; fallback to the normal 360p; settings switch EnableHD.
+- Suggested videos: two continuation pages of the watch-next list are followed (cap 40 -> 90, duplicates removed).
+- Suggested-video tiles ~25% larger when the row has room (YTCompactVideoView), settings switch BigTiles; layout dump of the first rows in the log.
+
 # TubeReplacer changelog since 2.0.37 (2.0.38 → 2.0.73)
 
 ## YouTube 12.x

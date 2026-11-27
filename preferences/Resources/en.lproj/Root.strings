@@ -61,6 +61,7 @@ settings.video.stream.custom_url_label = "Custom Stream URL";
 settings.video.enter_quality_options = "Quality Options";
 settings.video.allow_sabr = "Enable SABR";
 settings.video.allow_hls = "Enable HLS";
+settings.video.enable_hd = "720p HD playback";
 settings.video.respect_youtube_backoff = "Respect YT backoff";
 settings.video.allow_background_play = "Background Playback";
 settings.video.allow_dubbed_audio = "Use dubbed audio";
@@ -68,6 +69,7 @@ settings.video.allow_dubbed_audio = "Use dubbed audio";
 settings.misc.header = "Misc Settings";
 settings.misc.allow_returnyoutubedislikes = "Use RYTDL";
 settings.misc.allow_video_stats = "Enable Video Stats"; 
+settings.misc.big_tiles = "Bigger video tiles";
 
 settings.experimental.header = "Experimental Settings";
 settings.experimental.disclaimer = "No support will be given for these settings";

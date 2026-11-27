@@ -375,6 +375,5 @@ static id TRMakePlayerResponse(NSString *videoID, NSDictionary *json, NSURL *ove
 
 %end
 
-// HD streams are not built any more (plain 360p, like the original TubeReplacer): the bridge asks these and gets "none".
+// HD (720p through the iPhone client's HLS list) is built in innertube.x (TRFetchHDFormatsJSON); separate adaptive streams are not used.
 BOOL TRHDOnlyMode(void) { return NO; }
-void TRFetchHDFormatsJSON(NSString *videoID, NSDictionary *primary, void (^done)(NSArray *adaptive, NSString *hls)) { done(nil, nil); }
