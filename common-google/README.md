@@ -1,1 +1,0 @@
-this directory is for things which are needed across google's appstore apps, such as youtube & capture.
